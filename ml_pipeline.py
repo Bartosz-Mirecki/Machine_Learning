@@ -23,10 +23,8 @@ Usage example:
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import LabelEncoder, StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
@@ -69,10 +67,10 @@ def _build_model_registry() -> dict:
 # ---------------------------------------------------------------------------
 
 FILL_STRATEGIES = {
-    "mean":     "Fills with column mean (numeric only)",
-    "median":   "Fills with column median (numeric only)",
-    "mode":     "Fills with most frequent value",
-    "drop":     "Drops rows with missing values in this column",
+    "mean":           "Fills with column mean (numeric only)",
+    "median":         "Fills with column median (numeric only)",
+    "mode":           "Fills with most frequent value",
+    "drop":           "Drops rows with missing values in this column",
     "constant:VALUE": "Fills with a constant, e.g. 'constant:0' or 'constant:unknown'",
 }
 
@@ -95,7 +93,6 @@ def _apply_fill_strategy(df: pd.DataFrame, col: str, strategy: str) -> pd.DataFr
 
     elif strategy.startswith("constant:"):
         constant_value = strategy.split(":", 1)[1]
-        # Try to cast to number if possible
         try:
             constant_value = float(constant_value)
         except ValueError:
@@ -119,6 +116,9 @@ class MLPipeline:
     """
     A simple ML pipeline for classification on tabular data.
 
+    Categorical columns are encoded with OneHotEncoder (one binary column
+    per unique value). Numeric columns are scaled with StandardScaler.
+
     Parameters
     ----------
     df : pd.DataFrame
@@ -130,9 +130,11 @@ class MLPipeline:
         self.models = _build_model_registry()
         self.trained_models: dict = {}
         self.results: dict = {}
-        self.label_encoders: dict = {}
+        self.target_encoder = None      # LabelEncoder for the output column
+        self.preprocessor = None        # ColumnTransformer (OHE + scaler)
         self.X_test = None
         self.y_test = None
+        self._input_cols = None
         self._fitted = False
 
     # ------------------------------------------------------------------
@@ -166,12 +168,11 @@ class MLPipeline:
                     "status": "constant:unknown",
                     "notes":  "drop",
                 }
-            Columns not listed here are left as-is (NaNs may cause errors).
+            Columns not listed are left as-is (NaNs may cause errors).
         test_size : float
-            Fraction of data to use for testing (default 0.2 = 20%).
+            Fraction of data reserved for testing (default 0.2 = 20%).
         models : list[str] or "all"
-            Which models to train. Use "all" for all available models,
-            or a list like ["random_forest", "xgboost"].
+            Which models to train. Use "all" or e.g. ["random_forest", "xgboost"].
         random_state : int
             Random seed for reproducibility.
 
@@ -179,58 +180,95 @@ class MLPipeline:
         -------
         self (for method chaining)
         """
+        self._input_cols = input_cols
         df = self.df_original.copy()
 
-        # 1. Apply fill strategies
+        # 1. Apply per-column fill strategies
         if fill_strategy:
             for col, strategy in fill_strategy.items():
                 if col not in df.columns:
                     raise ValueError(f"Column '{col}' not found in DataFrame.")
                 df = _apply_fill_strategy(df, col, strategy)
 
-        # 2. Select only the columns we need
-        all_cols = input_cols + [output_col]
-        df = df[all_cols]
+        # 2. Keep only the columns we need
+        df = df[input_cols + [output_col]]
 
-        # 3. Encode categorical columns
-        df = self._encode_categoricals(df, input_cols)
-
-        # 4. Split into X / y
+        # 3. Split into X (features) and y (target)
         X = df[input_cols]
         y = df[output_col]
 
-        # Encode target if it is categorical
+        # 4. Encode target column if it is categorical (text/category)
         if y.dtype == object or str(y.dtype) == "category":
-            le = LabelEncoder()
-            y = pd.Series(le.fit_transform(y), name=output_col)
-            self.label_encoders["__target__"] = le
-            print(f"Target classes: {list(le.classes_)}")
+            self.target_encoder = LabelEncoder()
+            y = pd.Series(
+                self.target_encoder.fit_transform(y),
+                name=output_col
+            )
+            print(f"Target classes: {list(self.target_encoder.classes_)}")
 
-        # 5. Train / test split
-        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
+        # 5. Detect which input columns are categorical vs numeric
+        categorical_cols = [
+            col for col in input_cols
+            if X[col].dtype == object or str(X[col].dtype) == "category"
+        ]
+        numeric_cols = [
+            col for col in input_cols
+            if col not in categorical_cols
+        ]
+
+        print(f"Numeric columns  : {len(numeric_cols)}")
+        print(f"Categorical columns (OneHotEncoded): {len(categorical_cols)}")
+
+        # 6. Build the ColumnTransformer:
+        #    - OneHotEncoder for categorical columns
+        #      handle_unknown="ignore" → unknown values in predict() become all zeros
+        #    - StandardScaler for numeric columns
+        transformers = []
+        if categorical_cols:
+            transformers.append((
+                "onehot",
+                OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+                categorical_cols,
+            ))
+        if numeric_cols:
+            transformers.append((
+                "scaler",
+                StandardScaler(),
+                numeric_cols,
+            ))
+
+        self.preprocessor = ColumnTransformer(
+            transformers=transformers,
+            remainder="drop",
+        )
+
+        # 7. Train / test split
+        X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=random_state, stratify=y
         )
-        print(f"Train size: {len(self.X_train)}, Test size: {len(self.X_test)}")
+        self.X_test = X_test
+        self.y_test  = y_test
+        print(f"Train size: {len(X_train)}, Test size: {len(X_test)}")
 
-        # 6. Select models to train
+        # 8. Fit preprocessor on train, transform both sets
+        X_train_processed = self.preprocessor.fit_transform(X_train)
+        X_test_processed  = self.preprocessor.transform(X_test)
+
+        print(f"Feature matrix shape after encoding: {X_train_processed.shape}")
+
+        # 9. Train each selected model
         selected_models = self._select_models(models)
-
-        # 7. Scale features and train each model
-        self.scaler = StandardScaler()
-        X_train_scaled = self.scaler.fit_transform(self.X_train)
-        X_test_scaled  = self.scaler.transform(self.X_test)
-
         print("\nTraining models...")
         for name, model in selected_models.items():
             print(f"  → {name}...", end=" ")
-            model.fit(X_train_scaled, self.y_train)
-            y_pred = model.predict(X_test_scaled)
-            acc = accuracy_score(self.y_test, y_pred)
+            model.fit(X_train_processed, y_train)
+            y_pred = model.predict(X_test_processed)
+            acc = accuracy_score(y_test, y_pred)
             self.trained_models[name] = model
             self.results[name] = {
                 "accuracy": acc,
-                "y_pred": y_pred,
-                "report": classification_report(self.y_test, y_pred, output_dict=True),
+                "y_pred":   y_pred,
+                "report":   classification_report(y_test, y_pred, output_dict=True),
             }
             print(f"accuracy = {acc:.4f}")
 
@@ -279,8 +317,10 @@ class MLPipeline:
         """
         self._check_fitted()
         if model_name not in self.trained_models:
-            raise ValueError(f"Model '{model_name}' was not trained. "
-                             f"Available: {list(self.trained_models.keys())}")
+            raise ValueError(
+                f"Model '{model_name}' was not trained. "
+                f"Available: {list(self.trained_models.keys())}"
+            )
 
         y_pred = self.results[model_name]["y_pred"]
         print(f"\n=== Full Report: {model_name} ===")
@@ -301,7 +341,7 @@ class MLPipeline:
 
         Returns
         -------
-        np.ndarray of predicted labels.
+        np.ndarray of predicted labels (original class names if target was categorical).
         """
         self._check_fitted()
 
@@ -309,13 +349,13 @@ class MLPipeline:
             model_name = max(self.results, key=lambda m: self.results[m]["accuracy"])
             print(f"Using best model: {model_name}")
 
-        model = self.trained_models[model_name]
-        new_df_encoded = self._encode_categoricals(new_df, list(new_df.columns))
-        X_scaled = self.scaler.transform(new_df_encoded)
-        predictions = model.predict(X_scaled)
+        # Reuse the same preprocessor fitted during .fit()
+        X_processed = self.preprocessor.transform(new_df[self._input_cols])
+        predictions = self.trained_models[model_name].predict(X_processed)
 
-        if "__target__" in self.label_encoders:
-            predictions = self.label_encoders["__target__"].inverse_transform(predictions)
+        # Decode numeric predictions back to original class names
+        if self.target_encoder is not None:
+            predictions = self.target_encoder.inverse_transform(predictions)
 
         return predictions
 
@@ -333,26 +373,7 @@ class MLPipeline:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _encode_categoricals(self, df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-        """Label-encode all object/category columns in cols."""
-        df = df.copy()
-        for col in cols:
-            if col not in df.columns:
-                continue
-            if df[col].dtype == object or str(df[col].dtype) == "category":
-                if col not in self.label_encoders:
-                    self.label_encoders[col] = LabelEncoder()
-                    df[col] = self.label_encoders[col].fit_transform(
-                        df[col].astype(str)
-                    )
-                else:
-                    df[col] = self.label_encoders[col].transform(
-                        df[col].astype(str)
-                    )
-        return df
-
     def _select_models(self, models: list[str] | str) -> dict:
-        """Return subset of models based on user selection."""
         if models == "all":
             return self.models
         unknown = set(models) - set(self.models.keys())
